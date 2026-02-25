@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  graph_db:
+    image: graph_db:latest
+    container_name: graph_db-rag
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - GRAPH_DB_AUTH=graph_db/password123
+      - GRAPH_DB_PLUGINS=["apoc"]
+    volumes:
+      - graph_db_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u graph_db -p password123 'RETURN 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    container_name: graph-rag-api
+    ports:
+      - "8000:8000"
+    environment:
+      - GRAPH_DB_URI=bolt://graph_db:7687
+      - GRAPH_DB_USERNAME=graph_db
+      - GRAPH_DB_PASSWORD=password123
+      - REDIS_HOST=redis
+    depends_on:
+      graph_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  graph_db_data:

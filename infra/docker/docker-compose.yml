@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  graph_db:
+    image: graph_db:latest
+    container_name: graph_db-rag
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - GRAPH_DB_AUTH=graph_db/password123
+      - GRAPH_DB_PLUGINS=["apoc"]
+      - GRAPH_DB_dbms_memory_heap_max__size=2G
+    volumes:
+      - graph_db_data:/data
+      - graph_db_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u graph_db -p password123 'RETURN 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    container_name: graph_db-rag-api
+    ports:
+      - "8000:8000"
+    environment:
+      - GRAPH_DB_URI=bolt://graph_db:7687
+      - GRAPH_DB_USERNAME=graph_db
+      - GRAPH_DB_PASSWORD=password123
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      graph_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  graph_db_data:
+  graph_db_logs:
+  redis_data:

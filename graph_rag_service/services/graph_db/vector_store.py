@@ -1,0 +1,181 @@
+"""
+Vector store with user isolation
+"""
+from typing import List, Dict
+from graph_rag_service.services.graph_db.connector import GraphDBConnector
+from graph_rag_service.services.ollama.ollama_loader import OllamaLoader
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class VectorStore:
+    """Управление векторными эмбеддингами с изоляцией по пользователям"""
+    
+    def __init__(
+        self,
+        connector: GraphDBConnector,
+        ollama: OllamaLoader,
+        index_name: str = "chunk_embeddings",
+        dimensions: int = 768
+    ):
+        self.connector = connector
+        self.ollama = ollama
+        self.index_name = index_name
+        self.dimensions = dimensions
+    
+    def create_vector_index(self) -> None:
+        """Создание векторного индекса"""
+        query = f"""
+        CREATE VECTOR INDEX {self.index_name} IF NOT EXISTS
+        FOR (c:Chunk)
+        ON c.embedding
+        OPTIONS {{
+            indexConfig: {{
+                `vector.dimensions`: {self.dimensions},
+                `vector.similarity_function`: 'cosine'
+            }}
+        }}
+        """
+        
+        try:
+            self.connector.execute_write(query)
+            logger.info(f"✓ Vector index '{self.index_name}' created")
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info(f"✓ Vector index '{self.index_name}' already exists")
+            else:
+                raise
+    
+    def generate_embeddings(self, user_id: str = None) -> int:
+        """
+        Генерация эмбеддингов для чанков
+        
+        Args:
+            user_id: Если указан, генерирует только для чанков этого пользователя
+        """
+        if user_id:
+            query = """
+            MATCH (c:Chunk {user_id: $user_id})
+            WHERE c.embedding IS NULL
+            RETURN c.id as id, c.text as text
+            """
+            chunks = self.connector.execute_query(query, {"user_id": user_id})
+        else:
+            chunks = self.connector.execute_query("""
+                MATCH (c:Chunk)
+                WHERE c.embedding IS NULL
+                RETURN c.id as id, c.text as text
+            """)
+        
+        if not chunks:
+            logger.info("✓ All chunks have embeddings")
+            return 0
+        
+        logger.info(f"Generating embeddings for {len(chunks)} chunks...")
+        
+        for idx, chunk in enumerate(chunks):
+            embedding = self.ollama.embed_text(chunk["text"])
+            
+            self.connector.execute_write("""
+                MATCH (c:Chunk {id: $chunk_id})
+                SET c.embedding = $embedding
+            """, {"chunk_id": chunk["id"], "embedding": embedding})
+            
+            if (idx + 1) % 10 == 0:
+                logger.info(f"  Processed {idx + 1}/{len(chunks)}")
+        
+        logger.info(f"✓ Generated {len(chunks)} embeddings")
+        return len(chunks)
+    
+    def similarity_search(
+        self, 
+        query: str, 
+        k: int = 3,
+        user_id: str = None  # ✅ Фильтрация по пользователю
+    ) -> List[Dict]:
+        """
+        Векторный поиск с опциональной фильтрацией по user_id
+        """
+        query_embedding = self.ollama.embed_text(query)
+        
+        if user_id:
+            # Поиск только в документах пользователя
+            search_query = f"""
+            CALL db.index.vector.queryNodes(
+                '{self.index_name}',
+                {k * 3},  // Берём больше, т.к. будем фильтровать
+                $query_embedding
+            )
+            YIELD node, score
+            WHERE node.user_id = $user_id
+            RETURN node.id as chunk_id,
+                   node.text as text,
+                   score
+            ORDER BY score DESC
+            LIMIT {k}
+            """
+            results = self.connector.execute_query(search_query, {
+                "query_embedding": query_embedding,
+                "user_id": user_id
+            })
+        else:
+            # Поиск по всем документам (для админа или без аутентификации)
+            search_query = f"""
+            CALL db.index.vector.queryNodes(
+                '{self.index_name}',
+                {k},
+                $query_embedding
+            )
+            YIELD node, score
+            RETURN node.id as chunk_id,
+                   node.text as text,
+                   score
+            ORDER BY score DESC
+            """
+            results = self.connector.execute_query(search_query, {
+                "query_embedding": query_embedding
+            })
+        
+        return results
+    
+    def hybrid_search(
+        self, 
+        query: str, 
+        k: int = 3,
+        user_id: str = None  # ✅ Фильтрация по пользователю
+    ) -> List[Dict]:
+        """Гибридный поиск с контекстом и фильтрацией по user_id"""
+        vector_results = self.similarity_search(query, k, user_id)
+        
+        enriched = []
+        for result in vector_results:
+            context = self.connector.execute_query("""
+                MATCH (c:Chunk {id: $chunk_id})
+                OPTIONAL MATCH (prev:Chunk)-[:NEXT]->(c)
+                OPTIONAL MATCH (c)-[:NEXT]->(next:Chunk)
+                OPTIONAL MATCH (d:Document)-[:HAS_CHUNK]->(c)
+                RETURN 
+                    c.text as current,
+                    prev.text as prev,
+                    next.text as next,
+                    d.title as doc_title
+                LIMIT 1
+            """, {"chunk_id": result["chunk_id"]})
+            
+            if context:
+                ctx = context[0]
+                combined = ""
+                if ctx.get("prev"):
+                    combined += f"[Предыдущий]: {ctx['prev']}\n\n"
+                combined += f"[Основной]: {ctx['current']}"
+                if ctx.get("next"):
+                    combined += f"\n\n[Следующий]: {ctx['next']}"
+                
+                enriched.append({
+                    "text": combined,
+                    "doc_title": ctx.get("doc_title", "Unknown"),
+                    "score": result["score"]
+                })
+        
+        return enriched
